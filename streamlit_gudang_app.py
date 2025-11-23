@@ -940,7 +940,7 @@ elif menu == 'Laporan & Analisis':
     }
     if st.button('Download seluruh DB (Excel)'):
         data = export_db_to_excel()
-        st.download_button('Klik untuk download seluruh DB', data, file_name='gudang_export.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        st.download_button('Klik untuk download seluruh DB', data, file_name='gudang_konsumsi.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
     if st.button('Download laporan (Masuk / Keluar / Totals periode)'):
         bytes_xlsx = export_df_to_excel_bytes(reports)
