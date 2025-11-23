@@ -72,21 +72,24 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                t_type TEXT NOT NULL, -- 'in' or 'out'
+                trx_type TEXT NOT NULL, -- 'in' or 'out'
                 item_id INTEGER,
-                item_name TEXT,
+                name TEXT,
                 quantity REAL,
                 unit TEXT,
                 requester TEXT,
                 supplier TEXT,
                 note TEXT,
-                timestamp TEXT,
+                created_at TEXT,
                 bundle_code TEXT,
-                trx_code TEXT
+                trx_code TEXT,
+                expiry_date TEXT 
+                
             )
             """
         )
         conn.commit()
+        
 
 
 def hash_pw(pw: str) -> str:
@@ -119,9 +122,9 @@ def verify_login(username, password):
 
 # ------------------- Helpers -------------------
 
-def generate_trx_code(t_type):
+def generate_trx_code(trx_type):
     now = datetime.now().strftime('%Y%m%d-%H%M%S')
-    return f"TRX-{t_type.upper()}-{now}-{random.randint(100,999)}"
+    return f"TRX-{trx_type.upper()}-{now}-{random.randint(100,999)}"
 
 
 def upsert_item(name, category, unit, quantity, min_stock=0, rack_location="", expiry_date=None):
@@ -185,25 +188,33 @@ def adjust_item_for_out(name, unit, quantity):
         return item_id, None
 
 
-def add_transaction_record(t_type, item_id, item_name, quantity, unit, requester=None, supplier=None, note=None, bundle_code=None, trx_code=None, expiry_date=None):
-    now = datetime.now().isoformat()
+def add_transaction_record(trx_type, item_id, name, quantity, unit, requester, supplier, note, bundle_code, trx_code, expiry_date=None):
+    now = datetime.now()
     with closing(get_conn()) as conn:
         cur = conn.cursor()
-        cur.execute(
-            """
+        cur.execute("""
             INSERT INTO transactions(
-                trx_type, item_id, name, quantity, unit,
-                requester, supplier, note, bundle_code, trx_code,
-                expiry_date, created_at
+                trx_type, item_id, name, quantity, unit, requester, supplier, note,
+                bundle_code, trx_code, expiry_date, created_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (trx_type, item_id, name, quantity, unit,requester, supplier, note, bundle_code, trx_code, expiry_date, now)
-        )
-
+        """, (
+            trx_type,
+            item_id,
+            name,
+            quantity,
+            unit,
+            requester,
+            supplier,
+            note,
+            bundle_code,
+            trx_code,
+            expiry_date,
+            now
+        ))
 
         conn.commit()
-        return cur.lastrowid
+
 
 
 # ------------------- Loading / Exporting -------------------
@@ -245,12 +256,12 @@ def load_inventory_from_excel(buffer):
 def export_db_to_excel():
     with closing(get_conn()) as conn:
         items = pd.read_sql_query("SELECT * FROM items", conn)
-        trans = pd.read_sql_query("SELECT * FROM transactions ORDER BY timestamp DESC", conn)
+        trans = pd.read_sql_query("SELECT * FROM transactions ORDER BY created_at DESC", conn)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         items.to_excel(writer, sheet_name='inventory', index=False)
         trans.to_excel(writer, sheet_name='transactions', index=False)
-        writer.save()
+        writer.close()
     processed_data = output.getvalue()
     return processed_data
 
@@ -260,7 +271,7 @@ def export_df_to_excel_bytes(dict_of_dfs: dict):
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         for sheet_name, df in dict_of_dfs.items():
             df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-        writer.save()
+        writer.close()
     return output.getvalue()
 
 
@@ -268,63 +279,125 @@ def export_df_to_excel_bytes(dict_of_dfs: dict):
 
 def load_transactions_df():
     with closing(get_conn()) as conn:
-        df = pd.read_sql_query("SELECT * FROM transactions", conn, parse_dates=['timestamp'])
+        df = pd.read_sql_query(
+            "SELECT * FROM transactions",
+            conn,
+            parse_dates=['created_at']   # pastikan kolom ini ada di DB
+        )
+
     if df.empty:
         return df
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df['date'] = df['timestamp'].dt.date
-    df['month'] = df['timestamp'].dt.to_period('M').dt.to_timestamp()
-    df['week'] = df['timestamp'].dt.to_period('W').dt.start_time
+
+    # pastikan format datetime benar
+    df['created_at'] = pd.to_datetime(df['created_at'])
+
+    # tambahan kolom tanggal, bulan, minggu
+    df['date'] = df['created_at'].dt.date
+    df['month'] = df['created_at'].dt.to_period('M').dt.to_timestamp()
+    df['week'] = df['created_at'].dt.to_period('W').dt.start_time
+
     return df
+
 
 
 def summary_by_period(df, period='W'):
     if df.empty:
         return pd.DataFrame()
+
+    # pastikan df['date'] berbentuk datetime
+    df['date'] = pd.to_datetime(df['date'])
+
     if period == 'W':
-        g = df.groupby(['week', 'item_name', 'unit', 't_type'])['quantity'].sum().reset_index()
+        df['week'] = df['date'].dt.strftime('%Y-%W')
+        g = df.groupby(['week', 'name', 'unit', 'trx_type'])['quantity'].sum().reset_index()
         return g
+
     if period == 'M':
-        g = df.groupby(['month', 'item_name', 'unit', 't_type'])['quantity'].sum().reset_index()
+        df['month'] = df['date'].dt.strftime('%Y-%m')
+        g = df.groupby(['month', 'name', 'unit', 'trx_type'])['quantity'].sum().reset_index()
         return g
+
     return pd.DataFrame()
 
 
 def totals_for_period(df, date_from=None, date_to=None):
+    # baca stok akhir
     with closing(get_conn()) as conn:
-        items_df = pd.read_sql_query("SELECT id, name, unit, quantity as current_quantity FROM items", conn)
+        items_df = pd.read_sql_query(
+            "SELECT id, name, unit, quantity as current_quantity FROM items", conn
+        )
+
+    # jika df kosong
     if df.empty:
-        res = items_df.rename(columns={'name':'item_name','current_quantity':'stok_akhir'})
+        res = items_df.rename(columns={'name':'name','current_quantity':'stok_akhir'})
         res['total_masuk'] = 0
         res['total_keluar'] = 0
-        return res[['item_name','unit','total_masuk','total_keluar','stok_akhir']]
+        return res[['name','unit','total_masuk','total_keluar','stok_akhir']]
 
-    mask = pd.Series([True]*len(df))
+    # pastikan tanggal berbentuk datetime Pandas
+    df['date'] = pd.to_datetime(df['date'])
+
     if date_from:
-        mask = mask & (df['date'] >= date_from)
-    if date_to:
-        mask = mask & (df['date'] <= date_to)
-    period_df = df[mask]
-    masuk = period_df[period_df['t_type']=='in'].groupby(['item_name','unit'])['quantity'].sum().reset_index().rename(columns={'quantity':'total_masuk'})
-    keluar = period_df[period_df['t_type']=='out'].groupby(['item_name','unit'])['quantity'].sum().reset_index().rename(columns={'quantity':'total_keluar'})
+        date_from = pd.to_datetime(date_from)
 
-    merged = pd.merge(masuk, keluar, on=['item_name','unit'], how='outer').fillna(0)
-    merged = pd.merge(merged, items_df.rename(columns={'name':'item_name','current_quantity':'stok_akhir'}), on=['item_name','unit'], how='right')
-    merged['total_masuk'] = merged.get('total_masuk', 0).fillna(0)
-    merged['total_keluar'] = merged.get('total_keluar', 0).fillna(0)
-    merged['stok_akhir'] = merged.get('stok_akhir', 0).fillna(0)
-    merged = merged[['item_name','unit','total_masuk','total_keluar','stok_akhir']]
-    return merged
+    if date_to:
+        date_to = pd.to_datetime(date_to)
+
+    # filter
+    mask = pd.Series([True] * len(df))
+
+    if date_from:
+        mask &= (df['date'] >= date_from)
+
+    if date_to:
+        mask &= (df['date'] <= date_to)
+
+    period_df = df[mask]
+
+    # hitung masuk
+    masuk = (
+        period_df[period_df['trx_type']=='in']
+        .groupby(['name','unit'])['quantity']
+        .sum()
+        .reset_index()
+        .rename(columns={'quantity':'total_masuk'})
+    )
+
+    # hitung keluar
+    keluar = (
+        period_df[period_df['trx_type']=='out']
+        .groupby(['name','unit'])['quantity']
+        .sum()
+        .reset_index()
+        .rename(columns={'quantity':'total_keluar'})
+    )
+
+    # merge
+    merged = pd.merge(masuk, keluar, on=['name','unit'], how='outer').fillna(0)
+
+    merged = pd.merge(
+        merged,
+        items_df.rename(columns={'name':'name','current_quantity':'stok_akhir'}),
+        on=['name','unit'],
+        how='right'
+    )
+
+    # isi kosong
+    merged['total_masuk'] = merged['total_masuk'].fillna(0)
+    merged['total_keluar'] = merged['total_keluar'].fillna(0)
+    merged['stok_akhir'] = merged['stok_akhir'].fillna(0)
+
+    return merged[['name','unit','total_masuk','total_keluar','stok_akhir']]
 
 
 def compare_months(df, month_a, month_b, items_list=None):
     df_month = df.copy()
-    df_month['month_start'] = df_month['timestamp'].dt.to_period('M').dt.to_timestamp()
-    sel = df_month[df_month['month_start'].isin([month_a, month_b]) & (df_month['t_type']=='out')]
+    df_month['month_start'] = df_month['created_at'].dt.to_period('M').dt.to_created_at()
+    sel = df_month[df_month['month_start'].isin([month_a, month_b]) & (df_month['trx_type']=='out')]
     if items_list:
-        sel = sel[sel['item_name'].isin(items_list)]
-    pivot = sel.groupby(['month_start','item_name'])['quantity'].sum().reset_index()
-    cmp = pivot.pivot_table(index='item_name', columns='month_start', values='quantity', aggfunc='sum').fillna(0)
+        sel = sel[sel['name'].isin(items_list)]
+    pivot = sel.groupby(['month_start','name'])['quantity'].sum().reset_index()
+    cmp = pivot.pivot_table(index='name', columns='month_start', values='quantity', aggfunc='sum').fillna(0)
     if month_a in cmp.columns and month_b in cmp.columns:
         cmp['difference'] = cmp[month_b] - cmp[month_a]
         cmp['pct_change'] = cmp.apply(lambda r: (r['difference']/r[month_a]*100) if r[month_a]!=0 else None, axis=1)
@@ -413,7 +486,7 @@ if menu == 'Dashboard':
 
     st.subheader('Transaksi Terakhir')
     with closing(get_conn()) as conn:
-        trans = pd.read_sql_query("SELECT * FROM transactions ORDER BY timestamp DESC LIMIT 20", conn)
+        trans = pd.read_sql_query("SELECT * FROM transactions ORDER BY created_at DESC LIMIT 20", conn)
     st.dataframe(trans)
 
     # Total per item summary (overall)
@@ -423,8 +496,8 @@ if menu == 'Dashboard':
     st.dataframe(totals_all)
     st.markdown('Grafik Pemakaian (Total Keluar per Item - seluruh waktu)')
     if not df_all.empty:
-        out_all = df_all[df_all['t_type']=='out'].groupby(['item_name'])['quantity'].sum().reset_index()
-        chart = alt.Chart(out_all).mark_bar().encode(x='item_name:N', y='quantity:Q').properties(height=300).interactive()
+        out_all = df_all[df_all['trx_type']=='out'].groupby(['name'])['quantity'].sum().reset_index()
+        chart = alt.Chart(out_all).mark_bar().encode(x='name:N', y='quantity:Q').properties(height=300).interactive()
         st.altair_chart(chart, use_container_width=True)
 
 # Upload inventory
@@ -463,13 +536,16 @@ elif menu == 'Barang Masuk':
         with st.form('in_single'):
             use_existing = st.checkbox('Pilih dari daftar item yang ada', value=True)
             if use_existing and items_list:
-                name = st.selectbox('Nama barang', options=['-- (pilih) --'] + items_list)
-                if name == '-- (pilih) --':
-                    name = ''
-                unit = get_item_unit(name) if name else st.text_input('Satuan (baru)')
+                name_select = st.selectbox('Nama barang', ['-- (pilih) --'] + items_list)
+                if name_select != '-- (pilih) --':
+                    name = name_select
+                    unit = get_item_unit(name)
+                else:
+                    name = st.text_input("Nama barang baru")
+                    unit = st.text_input("Satuan")
             else:
-                name = st.text_input('Nama barang')
-                unit = st.text_input('Satuan')
+                name = st.text_input("Nama barang baru")
+                unit = st.text_input("Satuan")
             quantity = st.number_input('Jumlah', min_value=0.0, value=0.0)
             category = st.text_input('Kategori (opsional)')
             min_stock = st.number_input('Min stok (opsional)', min_value=0.0, value=0.0)
@@ -502,6 +578,7 @@ elif menu == 'Barang Masuk':
             st.session_state.in_multi.append({'name':'','unit':'','quantity':0.0,'category':'','min_stock':0.0})
 
     # ---------- FORM MULTI-ITEM ----------
+        # ---------- FORM MULTI-ITEM ----------
         with st.form('in_multi_form'):
             colA, colB = st.columns([2,1])
             with colA:
@@ -511,11 +588,14 @@ elif menu == 'Barang Masuk':
             with colB:
                 st.write('Baris current:', len(st.session_state.in_multi))
 
-        # buat input per baris
+    # per baris
             for i, it in enumerate(st.session_state.in_multi):
                 st.markdown(f'**Item #{i+1}**')
-                cols = st.columns([3, 1, 1, 2, 1,2])  # tambah satu kolom untuk delete
 
+        # Tambah kolom expiry date → total 7 kolom
+                cols = st.columns([3, 1, 1, 2, 1, 2, 2])
+
+        # Nama barang
                 name_choice = cols[0].selectbox(
                     f'Nama barang {i+1}',
                     options=['-- (new / pilih) --'] + items_list,
@@ -533,26 +613,33 @@ elif menu == 'Barang Masuk':
                 quantity = cols[2].number_input('Jumlah', min_value=0.0, value=float(it.get('quantity', 0.0)), key=f'in_multi_quantity_{i}')
                 min_stock = cols[3].number_input('Min stok', min_value=0.0, value=float(it.get('min_stock', 0.0)), key=f'in_multi_min_{i}')
                 rack_location = cols[5].text_input('Rak', value=it.get('rack_location',''), key=f'in_multi_rack_{i}')
-                
-            # tombol DELETE baris
-                del_row = cols[4].form_submit_button("🗑", key=f"del_row_{i}")
+
+        # NEW → input expiry date per baris
+                expiry_date = cols[6].text_input(
+                    'Kadaluarsa',
+                    value=it.get('expiry_date', ''),
+                    key=f'in_multi_expiry_{i}'
+                )
+
+        # DELETE BUTTON
+                del_row = cols[4].form_submit_button("🗑")
                 if del_row:
                     st.session_state.in_multi.pop(i)
                     st.rerun()
 
-            # update state
+        # UPDATE STATE
                 st.session_state.in_multi[i] = {
-                    'name': name,
-                    'unit': unit,
-                    'quantity': quantity,
-                    'category': it.get('category',''),
-                    'min_stock': min_stock,
-                    'rack_locatin':rack_location,
-                    'expiry_date':expiry_date
+                   'name': name,
+                   'unit': unit,
+                   'quantity': quantity,
+                   'category': it.get('category',''),
+                   'min_stock': min_stock,
+                   'rack_location': rack_location,
+                   'expiry_date': expiry_date
                 }
 
-        # SUBMIT FORM
             submitted = st.form_submit_button('Simpan Transaksi Masuk (Batch)')
+
 
     # ---------- SETELAH SUBMIT ----------
         if submitted:
@@ -726,7 +813,8 @@ elif menu == 'Laporan & Analisis':
         date_from = st.date_input('Dari', value=(datetime.now().date() - timedelta(days=30)))
     with col3:
         date_to = st.date_input('Sampai', value=datetime.now().date())
-
+    date_from = pd.to_datetime(date_from)
+    date_to = pd.to_datetime(date_to)
     st.markdown('---')
     if df.empty:
         st.info('Belum ada transaksi untuk ditampilkan')
@@ -734,23 +822,43 @@ elif menu == 'Laporan & Analisis':
         st.subheader('Total per Item dalam Periode Terpilih')
         totals = totals_for_period(df, date_from=date_from, date_to=date_to)
         st.dataframe(totals)
-        st.markdown('Grafik: Total Keluar per Item (periode terpilih)')
-        out_period = df[(df['t_type']=='out') & (df['date']>=date_from) & (df['date']<=date_to)]
+                       
+           
+        in_period = df[(df['trx_type']=='in') & (df['date']>=date_from) & (df['date']<=date_to)]
+        out_period = df[(df['trx_type']=='out') & (df['date']>=date_from) & (df['date']<=date_to)]
+        st.subheader("Transaksi Masuk (IN)")
+        if in_period.empty:
+            st.info('Tidak ada transaksi masuk pada periode yang dipilih')
+        else:
+            
+            st.dataframe(in_period)
+            st.markdown('Grafik: Total Masuk per Item (periode terpilih)')
+            in_sum = in_period.groupby('name')['quantity'].sum().reset_index()
+            chart = alt.Chart(in_sum).mark_bar().encode(x='name:N', y='quantity:Q').properties(height=300).interactive()
+            st.altair_chart(chart, use_container_width=True)
+       
+        
+        st.subheader("Transaksi Keluar (OUT)")
         if out_period.empty:
             st.info('Tidak ada transaksi keluar pada periode yang dipilih')
         else:
-            out_sum = out_period.groupby('item_name')['quantity'].sum().reset_index()
-            chart = alt.Chart(out_sum).mark_bar().encode(x='item_name:N', y='quantity:Q').properties(height=300).interactive()
-            st.altair_chart(chart, use_container_width=True)
-
+            
+            st.dataframe(out_period)
+            st.markdown('Grafik: Total Keluar per Item (periode terpilih)')
+            out_sum = out_period.groupby('name')['quantity'].sum().reset_index()
+            chart = alt.Chart(out_sum).mark_bar().encode(x='name:N', y='quantity:Q').properties(height=300).interactive()
+            st.altair_chart(chart, use_container_width=True)    
         st.markdown('---')
+        
+        
         if period == 'Mingguan':
             st.subheader('Ringkasan per Minggu (Total per Item)')
             g = summary_by_period(df, period='W')
             if g.empty:
                 st.info('Tidak ada data mingguan')
             else:
-                pivot = g.pivot_table(index=['week','item_name','unit'], columns='t_type', values='quantity', aggfunc='sum').fillna(0).reset_index()
+                trx_choice = st.selectbox("Pilih transaksi", ["in", "out"])
+                pivot = g.pivot_table(index=['week','name','unit'], columns='trx_type', values='quantity', aggfunc='sum').fillna(0).reset_index()
                 if 'in' not in pivot.columns:
                     pivot['in'] = 0
                 if 'out' not in pivot.columns:
@@ -760,16 +868,25 @@ elif menu == 'Laporan & Analisis':
                 week_choice = st.selectbox('Pilih minggu (start date)', sorted(pivot['week'].unique()), index=0)
                 pick = pivot[pivot['week']==week_choice]
                 if not pick.empty:
-                    st.markdown('Grafik: Total Keluar per Item pada minggu terpilih')
-                    chart2 = alt.Chart(pick).mark_bar().encode(x='item_name:N', y='total_keluar:Q').properties(height=300).interactive()
+                    show_col = 'total_masuk' if trx_choice=='in' else 'total_keluar'
+
+                    st.markdown(f"Grafik: Total {trx_choice} per Item pada minggu terpilih")
+
+                    chart2 = alt.Chart(pick).mark_bar().encode(
+                        x='name:N',
+                        y=f'{show_col}:Q'
+                    ).properties(height=300).interactive()
+
                     st.altair_chart(chart2, use_container_width=True)
+
         else:
             st.subheader('Ringkasan per Bulan (Total per Item)')
             g = summary_by_period(df, period='M')
             if g.empty:
                 st.info('Tidak ada data bulanan')
             else:
-                pivot = g.pivot_table(index=['month','item_name','unit'], columns='t_type', values='quantity', aggfunc='sum').fillna(0).reset_index()
+                trx_choice = st.selectbox("Pilih transaksi", ["in", "out"])
+                pivot = g.pivot_table(index=['month','name','unit'], columns='trx_type', values='quantity', aggfunc='sum').fillna(0).reset_index()
                 if 'in' not in pivot.columns:
                     pivot['in'] = 0
                 if 'out' not in pivot.columns:
@@ -779,8 +896,15 @@ elif menu == 'Laporan & Analisis':
                 month_choice = st.selectbox('Pilih bulan', sorted(pivot['month'].unique()), index=0)
                 pick = pivot[pivot['month']==month_choice]
                 if not pick.empty:
-                    st.markdown('Grafik: Total Keluar per Item pada bulan terpilih')
-                    chart2 = alt.Chart(pick).mark_bar().encode(x='item_name:N', y='total_keluar:Q').properties(height=300).interactive()
+                    show_col = 'total_masuk' if trx_choice=='in' else 'total_keluar'
+
+                    st.markdown(f"Grafik: Total {trx_choice} per Item pada minggu terpilih")
+
+                    chart2 = alt.Chart(pick).mark_bar().encode(
+                        x='name:N',
+                        y=f'{show_col}:Q'
+                    ).properties(height=300).interactive()
+
                     st.altair_chart(chart2, use_container_width=True)
 
         st.markdown('---')
@@ -794,7 +918,7 @@ elif menu == 'Laporan & Analisis':
                 m1 = st.selectbox('Bulan A', months, index=max(0, len(months)-2))
             with colB:
                 m2 = st.selectbox('Bulan B', months, index=max(0, len(months)-1))
-            items = sorted(df['item_name'].unique())
+            items = sorted(df['name'].unique())
             sel_items = st.multiselect('Pilih item untuk bandingkan', items, default=items[:5])
             cmp = compare_months(df, m1, m2, items_list=sel_items if sel_items else None)
             if cmp.empty:
@@ -802,7 +926,7 @@ elif menu == 'Laporan & Analisis':
             else:
                 st.dataframe(cmp)
                 if 'difference' in cmp.columns:
-                    chart_cmp = alt.Chart(cmp).mark_bar().encode(x='item_name:N', y='difference:Q').properties(height=300).interactive()
+                    chart_cmp = alt.Chart(cmp).mark_bar().encode(x='name:N', y='difference:Q').properties(height=300).interactive()
                     st.altair_chart(chart_cmp, use_container_width=True)
 
     st.markdown('---')
