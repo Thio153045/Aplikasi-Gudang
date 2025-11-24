@@ -494,12 +494,18 @@ if menu == 'Dashboard':
     df_all = load_transactions_df()
     totals_all = totals_for_period(df_all)
     st.dataframe(totals_all)
-    st.markdown('Grafik Pemakaian (Total Keluar per Item - seluruh waktu)')
+    
+    
     if not df_all.empty:
+        st.markdown('Grafik Pemakaian (Total masuk per Item - seluruh waktu)')
+        in_all = df_all[df_all['trx_type']=='in'].groupby(['name'])['quantity'].sum().reset_index()
+        chart = alt.Chart(in_all).mark_bar().encode(x='name:N', y='quantity:Q').properties(height=300).interactive()
+        st.altair_chart(chart, use_container_width=True)
+        st.markdown('Grafik Pemakaian (Total Keluar per Item - seluruh waktu)')
         out_all = df_all[df_all['trx_type']=='out'].groupby(['name'])['quantity'].sum().reset_index()
         chart = alt.Chart(out_all).mark_bar().encode(x='name:N', y='quantity:Q').properties(height=300).interactive()
         st.altair_chart(chart, use_container_width=True)
-
+          
 # Upload inventory
 elif menu == 'Upload Inventaris (Excel)':
     st.title('Upload Inventaris Awal dari Excel')
