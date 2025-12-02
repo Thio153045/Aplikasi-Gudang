@@ -1,228 +1,208 @@
-"""
-Streamlit Warehouse app (Gudang Bahan Makanan & Alat Kerja)
-Single-file app: streamlit_gudang_app.py
-Requirements:
-  pip install streamlit pandas openpyxl altair
-
-Features implemented (extended):
-  - Login (username/password) with simple sqlite users table (default admin/admin123)
-  - Upload initial inventory from Excel
-  - Single-item & Multi-item forms for Barang Masuk & Barang Keluar (with explicit Save/Submit buttons)
-  - Dynamic rows (+ Tambah Item, Hapus baris) for multi-item
-  - SQLite backend: items, transactions, users; transactions now have `bundle_code` to group multi-item transactions
-  - Auto-fill unit when selecting existing item from dropdown
-  - Searchable dropdowns (Streamlit selectbox supports typing)
-  - Auto-generate transaction code: TRX-[IN/OUT]-YYYYMMDD-HHMMSS
-  - Validation: Barang Keluar rejected if any item stock insufficient
-  - Totals per item in Dashboard and Reports; Weekly/Monthly summaries; Comparison between months
-  - Export: entire DB or specific reports to Excel
-
-Notes:
- - This is a single-file reference implementation. You can refine UI/UX and security (password hashing/salting, sessions) further.
- - To run: `streamlit run streamlit_gudang_app.py`
-"""
+# streamlit_gudang_supabase.py
+# Versi lengkap: Streamlit app terhubung ke Supabase (mengganti SQLite)
+#
+# SEBELUM MENJALANKAN:
+# 1) Buat tabel di Supabase SQL Editor (copy-paste dan RUN):
+# ----------------------------------------------------------------
+# CREATE TABLE IF NOT EXISTS users (
+#   username TEXT PRIMARY KEY,
+#   password_hash TEXT NOT NULL
+# );
+#
+# CREATE TABLE IF NOT EXISTS items (
+#   id SERIAL PRIMARY KEY,
+#   name TEXT NOT NULL,
+#   category TEXT,
+#   unit TEXT,
+#   quantity DOUBLE PRECISION DEFAULT 0,
+#   min_stock DOUBLE PRECISION DEFAULT 0,
+#   rack_location TEXT,
+#   expiry_date DATE,
+#   created_at TIMESTAMP,
+#   updated_at TIMESTAMP
+# );
+#
+# CREATE TABLE IF NOT EXISTS transactions (
+#   id SERIAL PRIMARY KEY,
+#   trx_type TEXT NOT NULL,
+#   item_id INTEGER,
+#   name TEXT,
+#   quantity DOUBLE PRECISION,
+#   unit TEXT,
+#   requester TEXT,
+#   supplier TEXT,
+#   note TEXT,
+#   bundle_code TEXT,
+#   trx_code TEXT,
+#   expiry_date DATE,
+#   created_at TIMESTAMP
+# );
+# ----------------------------------------------------------------
+#
+# 2) Atur st.secrets di Streamlit (LOCAL: ~/.streamlit/secrets.toml atau Streamlit Cloud Secrets)
+# SUPABASE_URL = 
+# SUPABASE_KEY = "cm9sZSI6ImFub24iLCJpYXQiOjE3NjQwNjIzNDIsImV4cCI6MjA3OTYzODM0Mn0.uAW_wTrjEx0vt4hY6SHCtqcEa3Qjtxk2g7GNa7SrRZ4"
+#
+# 3) Install dependency:
+# pip install streamlit pandas openpyxl supabase altair
 
 import streamlit as st
 import pandas as pd
-import sqlite3
-import hashlib
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import altair as alt
-import os
 import random
-from contextlib import closing
+import hashlib
+from supabase import create_client, Client
 
-DB_PATH = "gudang.db"
+# -------------------------
+# Supabase client (from secrets)
+# -------------------------
+if "SUPABASE_URL" not in st.secrets or "SUPABASE_KEY" not in st.secrets:
+    st.error("SUPABASE_URL dan SUPABASE_KEY belum ada di st.secrets. Silakan tambahkan sebelum menjalankan.")
+    st.stop()
 
-# ------------------- Utilities -------------------
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-
-def init_db():
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                username TEXT PRIMARY KEY,
-                password_hash TEXT NOT NULL
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                category TEXT,
-                unit TEXT,
-                quantity REAL DEFAULT 0,
-                min_stock REAL DEFAULT 0,
-                rack_location TEXT,
-                expiry_date TEXT,
-                created_at TEXT,
-                updated_at TEXT
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trx_type TEXT NOT NULL, -- 'in' or 'out'
-                item_id INTEGER,
-                name TEXT,
-                quantity REAL,
-                unit TEXT,
-                requester TEXT,
-                supplier TEXT,
-                note TEXT,
-                created_at TEXT,
-                bundle_code TEXT,
-                trx_code TEXT,
-                expiry_date TEXT 
-                
-            )
-            """
-        )
-        conn.commit()
-        
-
-
+# -------------------------
+# Utility: hashing password
+# -------------------------
 def hash_pw(pw: str) -> str:
     return hashlib.sha256(pw.encode("utf-8")).hexdigest()
 
-
+# -------------------------
+# Ensure default admin exists
+# -------------------------
 def ensure_default_admin():
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM users")
-        cnt = cur.fetchone()[0]
-        if cnt == 0:
-            cur.execute(
-                "INSERT INTO users(username, password_hash) VALUES (?, ?)",
-                ("admin", hash_pw("admin123")),
-            )
-            conn.commit()
+    q = supabase.table("users").select("username").limit(1).execute()
+    if not q.data:
+        supabase.table("users").insert({
+            "username": "admin",
+            "password_hash": hash_pw("admin123")
+        }).execute()
 
-
-def verify_login(username, password):
+# -------------------------
+# Auth
+# -------------------------
+def verify_login(username: str, password: str) -> bool:
+    if not username:
+        return False
     pw_hash = hash_pw(password)
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT password_hash FROM users WHERE username=?", (username,))
-        row = cur.fetchone()
-        if not row:
-            return False
-        return row[0] == pw_hash
+    q = supabase.table("users").select("password_hash").eq("username", username).limit(1).execute()
+    if not q.data:
+        return False
+    return q.data[0].get("password_hash") == pw_hash
 
-
-# ------------------- Helpers -------------------
-
-def generate_trx_code(trx_type):
+# -------------------------
+# Helpers: items & transactions
+# -------------------------
+def generate_trx_code(trx_type: str) -> str:
     now = datetime.now().strftime('%Y%m%d-%H%M%S')
     return f"TRX-{trx_type.upper()}-{now}-{random.randint(100,999)}"
 
+def get_inventory_df() -> pd.DataFrame:
+    q = supabase.table("items").select("*").order("name", desc=False).execute()
 
-def upsert_item(name, category, unit, quantity, min_stock=0, rack_location="", expiry_date=None):
+    rows = q.data or []
+    if not rows:
+        return pd.DataFrame(columns=["id","name","category","unit","quantity","min_stock","rack_location","expiry_date","created_at","updated_at"])
+    df = pd.DataFrame(rows)
+    # Normalize dates
+    if "expiry_date" in df.columns:
+        df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce").dt.date
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    return df
 
-    name = name.strip()
+def get_items_list():
+    df = get_inventory_df()
+    if df.empty:
+        return []
+    return df["name"].tolist()
+
+def get_item_unit(name: str):
+    if not name:
+        return ""
+    q = supabase.table("items").select("unit").eq("name", name).limit(1).execute()
+    if not q.data:
+        return ""
+    return q.data[0].get("unit","") or ""
+
+def upsert_item(name, category, unit, quantity, min_stock=0.0, rack_location="", expiry_date=None):
+    name = (name or "").strip()
     now = datetime.now().isoformat()
-
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-
-        # cek apakah item sudah ada
-        cur.execute(
-            "SELECT id, quantity FROM items WHERE name=? AND unit=?",
-            (name, unit)
-        )
-        row = cur.fetchone()
-
-        if row:
-            item_id, existing_quantity = row
-            new_quantity = existing_quantity + quantity
-
-            # update item existing
-            cur.execute(
-                """
-                UPDATE items SET  quantity=?, category=?, min_stock=?, rack_location=?, expiry_date=?, created_at=?, updated_at=?
-                WHERE id=?
-
-                """,
-                (new_quantity, category, min_stock, rack_location,expiry_date, now,now, item_id)
-            )
-            conn.commit()
-            return item_id
-
-        else:
-            # insert item baru
-            cur.execute(
-                """
-                INSERT INTO items(name, category, unit, quantity, min_stock, rack_location, expiry_date, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (name, category, unit, quantity, min_stock, rack_location, expiry_date, now, now)
-            )
-            conn.commit()
-            return cur.lastrowid
-
-
+    # find by name+unit
+    res = supabase.table("items").select("*").eq("name", name).eq("unit", unit).limit(1).execute()
+    if res.data:
+        item = res.data[0]
+        existing_qty = item.get("quantity") or 0
+        new_qty = existing_qty + (quantity or 0)
+        supabase.table("items").update({
+            "quantity": new_qty,
+            "category": category,
+            "min_stock": min_stock,
+            "rack_location": rack_location,
+            "expiry_date": expiry_date.isoformat() if isinstance(expiry_date, (date,)) else expiry_date,
+            "updated_at": now
+        }).eq("id", item["id"]).execute()
+        return item["id"]
+    else:
+        ins = supabase.table("items").insert({
+            "name": name,
+            "category": category,
+            "unit": unit,
+            "quantity": quantity or 0,
+            "min_stock": min_stock or 0,
+            "rack_location": rack_location,
+            "expiry_date": expiry_date.isoformat() if isinstance(expiry_date, (date,)) else expiry_date,
+            "created_at": now,
+            "updated_at": now
+        }).execute()
+        return ins.data[0]["id"]
 
 def adjust_item_for_out(name, unit, quantity):
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, quantity FROM items WHERE name=? AND unit=?", (name, unit))
-        row = cur.fetchone()
-        if not row:
-            return None, "Item tidak ditemukan"
-        item_id, existing_quantity = row
-        if existing_quantity < quantity:
-            return None, "Stok tidak cukup: tersedia {}".format(existing_quantity)
-        new_quantity = existing_quantity - quantity
-        cur.execute("UPDATE items SET quantity=? WHERE id=?", (new_quantity, item_id))
-        conn.commit()
-        return item_id, None
-
+    res = supabase.table("items").select("*").eq("name", name).eq("unit", unit).limit(1).execute()
+    if not res.data:
+        return None, "Item tidak ditemukan"
+    item = res.data[0]
+    existing = item.get("quantity") or 0
+    if existing < quantity:
+        return None, f"Stok tidak cukup: tersedia {existing}"
+    new_qty = existing - quantity
+    supabase.table("items").update({"quantity": new_qty, "updated_at": datetime.now().isoformat()}).eq("id", item["id"]).execute()
+    return item["id"], None
 
 def add_transaction_record(trx_type, item_id, name, quantity, unit, requester, supplier, note, bundle_code, trx_code, expiry_date=None):
-    now = datetime.now()
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO transactions(
-                trx_type, item_id, name, quantity, unit, requester, supplier, note,
-                bundle_code, trx_code, expiry_date, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            trx_type,
-            item_id,
-            name,
-            quantity,
-            unit,
-            requester,
-            supplier,
-            note,
-            bundle_code,
-            trx_code,
-            expiry_date,
-            now
-        ))
+    now = datetime.now().isoformat()
+    supabase.table("transactions").insert({
+        "trx_type": trx_type,
+        "item_id": item_id,
+        "name": name,
+        "quantity": quantity,
+        "unit": unit,
+        "requester": requester,
+        "supplier": supplier,
+        "note": note,
+        "bundle_code": bundle_code,
+        "trx_code": trx_code,
+        "expiry_date": expiry_date.isoformat() if isinstance(expiry_date, (date,)) else expiry_date,
+        "created_at": now
+    }).execute()
 
-        conn.commit()
+# -------------------------
+# Load / Export
+# -------------------------
+def load_inventory_from_excel(buffer) -> int:
+    """ buffer can be file-like or BytesIO from uploaded file """
+    if isinstance(buffer, io.BytesIO):
+        buffer.seek(0)
+        df = pd.read_excel(buffer)
+    else:
+        df = pd.read_excel(buffer)
 
-
-
-# ------------------- Loading / Exporting -------------------
-
-def load_inventory_from_excel(buffer):
-    df = pd.read_excel(buffer)
     df_columns = {c.lower(): c for c in df.columns}
-
     required = ['name', 'quantity', 'unit']
     for r in required:
         if r not in df_columns:
@@ -231,87 +211,68 @@ def load_inventory_from_excel(buffer):
     inserted = 0
     for _, row in df.iterrows():
         name = str(row[df_columns['name']]).strip()
-        quantity = float(row[df_columns['quantity']]) if not pd.isna(row[df_columns['quantity']]) else 0
+        quantity = float(row[df_columns['quantity']]) if not pd.isna(row[df_columns['quantity']]) else 0.0
         unit = str(row[df_columns['unit']]).strip()
         category = str(row[df_columns['category']]).strip() if 'category' in df_columns else ''
-        min_stock = float(row[df_columns['min_stock']]) if 'min_stock' in df_columns and not pd.isna(row[df_columns['min_stock']]) else 0
-
-        # 🔥 Tambahan paling penting
+        min_stock = float(row[df_columns['min_stock']]) if 'min_stock' in df_columns and not pd.isna(row[df_columns['min_stock']]) else 0.0
         rack_location = str(row[df_columns['rack_location']]).strip() if 'rack_location' in df_columns else ''
-        expiry_date = (
-            row[df_columns['expiry_date']].date() 
-            if 'expiry_date' in df_columns and not pd.isna(row[df_columns['expiry_date']])
-            else None
-        )
+        expiry_date = None
+        if 'expiry_date' in df_columns and not pd.isna(row[df_columns['expiry_date']]):
+            val = row[df_columns['expiry_date']]
+            if isinstance(val, (pd.Timestamp, datetime, date)):
+                expiry_date = val.date() if isinstance(val, pd.Timestamp) else (val if isinstance(val, date) else None)
+            else:
+                # try parse
+                try:
+                    expiry_date = pd.to_datetime(val).date()
+                except:
+                    expiry_date = None
 
-        # Anda harus update fungsi upsert agar menerima parameter baru:
         upsert_item(name, category, unit, quantity, min_stock, rack_location, expiry_date)
-
         inserted += 1
 
     return inserted
 
-
-
-def export_db_to_excel():
-    with closing(get_conn()) as conn:
-        items = pd.read_sql_query("SELECT * FROM items", conn)
-        trans = pd.read_sql_query("SELECT * FROM transactions ORDER BY created_at DESC", conn)
+def export_db_to_excel_bytes():
+    items_q = supabase.table("items").select("*").order("name", {"ascending": True}).execute()
+    trans_q = supabase.table("transactions").select("*").order("created_at", {"ascending": False}).execute()
+    df_items = pd.DataFrame(items_q.data or [])
+    df_trans = pd.DataFrame(trans_q.data or [])
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        items.to_excel(writer, sheet_name='inventory', index=False)
-        trans.to_excel(writer, sheet_name='transactions', index=False)
-        writer.close()
-    processed_data = output.getvalue()
-    return processed_data
-
-
-def export_df_to_excel_bytes(dict_of_dfs: dict):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        for sheet_name, df in dict_of_dfs.items():
-            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-        writer.close()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_items.to_excel(writer, sheet_name="inventory", index=False)
+        df_trans.to_excel(writer, sheet_name="transactions", index=False)
+        writer.save()
     return output.getvalue()
 
-
-# ------------------- Reporting -------------------
-
+# -------------------------
+# Reporting helpers
+# -------------------------
 def load_transactions_df():
-    with closing(get_conn()) as conn:
-        df = pd.read_sql_query(
-            "SELECT * FROM transactions",
-            conn,
-            parse_dates=['created_at']   # pastikan kolom ini ada di DB
-        )
-
+    q = supabase.table("transactions").select("*").order("created_at", desc=False).execute()
+    df = pd.DataFrame(q.data or [])
     if df.empty:
         return df
-
-    # pastikan format datetime benar
-    df['created_at'] = pd.to_datetime(df['created_at'])
-
-    # tambahan kolom tanggal, bulan, minggu
-    df['date'] = df['created_at'].dt.date
-    df['month'] = df['created_at'].dt.to_period('M').dt.to_timestamp()
-    df['week'] = df['created_at'].dt.to_period('W').dt.start_time
-
+    df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    df["date"] = df["created_at"].dt.date
+    df["month"] = df["created_at"].dt.to_period("M").dt.to_timestamp()
+    df["week"] = df["created_at"].dt.to_period("W").dt.start_time
     return df
 
-
-
-def summary_by_period(df, period='W'):
+def totals_for_period(df):
     if df.empty:
         return pd.DataFrame()
 
-    # pastikan df['date'] berbentuk datetime
+    # pastikan kolom date sudah datetime
     df['date'] = pd.to_datetime(df['date'])
 
+    # Mingguan
     if period == 'W':
         df['week'] = df['date'].dt.strftime('%Y-%W')
         g = df.groupby(['week', 'name', 'unit', 'trx_type'])['quantity'].sum().reset_index()
         return g
 
+    # Bulanan
     if period == 'M':
         df['month'] = df['date'].dt.strftime('%Y-%m')
         g = df.groupby(['month', 'name', 'unit', 'trx_type'])['quantity'].sum().reset_index()
@@ -320,231 +281,104 @@ def summary_by_period(df, period='W'):
     return pd.DataFrame()
 
 
-def totals_for_period(df, date_from=None, date_to=None):
-    # baca stok akhir
-    with closing(get_conn()) as conn:
-        items_df = pd.read_sql_query(
-            "SELECT id, name, unit, quantity as current_quantity FROM items", conn
-        )
-
-    # jika df kosong
-    if df.empty:
-        res = items_df.rename(columns={'name':'name','current_quantity':'stok_akhir'})
-        res['total_masuk'] = 0
-        res['total_keluar'] = 0
-        return res[['name','unit','total_masuk','total_keluar','stok_akhir']]
-
-    # pastikan tanggal berbentuk datetime Pandas
-    df['date'] = pd.to_datetime(df['date'])
-
-    if date_from:
-        date_from = pd.to_datetime(date_from)
-
-    if date_to:
-        date_to = pd.to_datetime(date_to)
-
-    # filter
-    mask = pd.Series([True] * len(df))
-
-    if date_from:
-        mask &= (df['date'] >= date_from)
-
-    if date_to:
-        mask &= (df['date'] <= date_to)
-
-    period_df = df[mask]
-
-    # hitung masuk
-    masuk = (
-        period_df[period_df['trx_type']=='in']
-        .groupby(['name','unit'])['quantity']
-        .sum()
-        .reset_index()
-        .rename(columns={'quantity':'total_masuk'})
-    )
-
-    # hitung keluar
-    keluar = (
-        period_df[period_df['trx_type']=='out']
-        .groupby(['name','unit'])['quantity']
-        .sum()
-        .reset_index()
-        .rename(columns={'quantity':'total_keluar'})
-    )
-
-    # merge
-    merged = pd.merge(masuk, keluar, on=['name','unit'], how='outer').fillna(0)
-
-    merged = pd.merge(
-        merged,
-        items_df.rename(columns={'name':'name','current_quantity':'stok_akhir'}),
-        on=['name','unit'],
-        how='right'
-    )
-
-    # isi kosong
-    merged['total_masuk'] = merged['total_masuk'].fillna(0)
-    merged['total_keluar'] = merged['total_keluar'].fillna(0)
-    merged['stok_akhir'] = merged['stok_akhir'].fillna(0)
-
-    return merged[['name','unit','total_masuk','total_keluar','stok_akhir']]
-
-
-def compare_months(df, month_a, month_b, items_list=None):
-    df_month = df.copy()
-    df_month['month_start'] = df_month['created_at'].dt.to_period('M').dt.to_created_at()
-    sel = df_month[df_month['month_start'].isin([month_a, month_b]) & (df_month['trx_type']=='out')]
-    if items_list:
-        sel = sel[sel['name'].isin(items_list)]
-    pivot = sel.groupby(['month_start','name'])['quantity'].sum().reset_index()
-    cmp = pivot.pivot_table(index='name', columns='month_start', values='quantity', aggfunc='sum').fillna(0)
-    if month_a in cmp.columns and month_b in cmp.columns:
-        cmp['difference'] = cmp[month_b] - cmp[month_a]
-        cmp['pct_change'] = cmp.apply(lambda r: (r['difference']/r[month_a]*100) if r[month_a]!=0 else None, axis=1)
-    return cmp.reset_index()
-
-
-# ------------------- Streamlit App -------------------
-
-st.set_page_config(page_title='Gudang - Streamlit', layout='wide')
-
-init_db()
-ensure_default_admin()
-
-if 'auth' not in st.session_state:
-    st.session_state.auth = False
-if 'user' not in st.session_state:
-    st.session_state.user = None
 
 # --- Login ---
 if not st.session_state.auth:
-    st.title("Login - Aplikasi Gudang")
-    with st.form('login_form'):
-        username = st.text_input('Username')
-        password = st.text_input('Password', type='password')
-        submitted = st.form_submit_button('Login')
+    st.title("Login - Aplikasi Gudang (Supabase)")
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
         if submitted:
             if verify_login(username, password):
                 st.session_state.auth = True
                 st.session_state.user = username
-                st.success('Login sukses sebagai ' + username)
+                st.success(f"Login sukses sebagai {username}")
                 st.rerun()
             else:
-                st.error('Username atau password salah')
-
-    st.markdown("---")
-    st.info("Default akun: **admin / admin123** (ubah segera setelah masuk)")
+                st.error("Username atau password salah")
+    st.info("Default akun: admin / admin123 (ubah setelah login)")
     st.stop()
 
-# --- Main app after login ---
-st.sidebar.title('Menu')
-menu = st.sidebar.radio('Pilih', ['Dashboard', 'Upload Inventaris (Excel)', 'Barang Masuk', 'Barang Keluar', 'Laporan & Analisis', 'Pengaturan'])
-
-st.sidebar.write('User:', st.session_state.user)
-if st.sidebar.button('Logout'):
+# Main UI after login
+st.sidebar.title("Menu")
+menu = st.sidebar.radio("Pilih", ["Dashboard", "Upload Inventaris (Excel)", "Barang Masuk", "Barang Keluar", "Laporan & Analisis", "Pengaturan"])
+st.sidebar.write("User:", st.session_state.user)
+if st.sidebar.button("Logout"):
     st.session_state.auth = False
     st.session_state.user = None
-    st.rerun()
+    st.created_atrerun()
 
-# Helpers to display inventory
-
-def get_inventory_df():
-    with closing(get_conn()) as conn:
-        df = pd.read_sql_query("SELECT * FROM items ORDER BY name", conn)
-    return df
-
-
-def get_items_list():
-    df = get_inventory_df()
-    if df.empty:
-        return []
-    return df['name'].tolist()
-
-
-def get_item_unit(name):
-    if not name:
-        return ''
-    with closing(get_conn()) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT unit FROM items WHERE name=? LIMIT 1", (name,))
-        row = cur.fetchone()
-        return row[0] if row else ''
-
-# Dashboard
-if menu == 'Dashboard':
-    st.title('Dashboard Gudang')
+# --- Dashboard ---
+if menu == "Dashboard":
+    st.title("Dashboard Gudang")
     inv = get_inventory_df()
-    st.subheader('Ringkasan Stok')
+    st.subheader("Inventaris")
     if inv.empty:
-        st.info('Inventaris kosong. Silakan upload data awal atau tambah barang masuk.')
+        st.info("Inventaris kosong. Silakan upload data awal.")
     else:
         st.dataframe(inv)
-        low = inv[inv['quantity'] <= inv['min_stock']]
+        low = inv[inv["quantity"] <= inv["min_stock"]]
         if not low.empty:
-            st.warning('Beberapa item mencapai atau di bawah minimal stok:')
-            st.table(low[['name', 'quantity', 'min_stock', 'unit']])
+            st.warning("Beberapa item mencapai atau di bawah min stock:")
+            st.table(low[["name","quantity","min_stock","unit"]])
 
-    st.subheader('Transaksi Terakhir')
-    with closing(get_conn()) as conn:
-        trans = pd.read_sql_query("SELECT * FROM transactions ORDER BY created_at DESC LIMIT 20", conn)
-    st.dataframe(trans)
+    st.subheader("Transaksi Terakhir")
+    trans_q = (supabase.table("transactions").select("*") .order("created_at", desc=True) .limit(20).execute())
 
-    # Total per item summary (overall)
-    st.subheader('Total per Item (seluruh waktu)')
+    trans_df = pd.DataFrame(trans_q.data or [])
+    st.dataframe(trans_df)
+
+    st.subheader("Total per Item (seluruh waktu)")
     df_all = load_transactions_df()
     totals_all = totals_for_period(df_all)
     st.dataframe(totals_all)
-    
-    
+
     if not df_all.empty:
-        st.markdown('Grafik Pemakaian (Total masuk per Item - seluruh waktu)')
-        in_all = df_all[df_all['trx_type']=='in'].groupby(['name'])['quantity'].sum().reset_index()
-        chart = alt.Chart(in_all).mark_bar().encode(x='name:N', y='quantity:Q').properties(height=300).interactive()
-        st.altair_chart(chart, use_container_width=True)
-        st.markdown('Grafik Pemakaian (Total Keluar per Item - seluruh waktu)')
-        out_all = df_all[df_all['trx_type']=='out'].groupby(['name'])['quantity'].sum().reset_index()
-        chart = alt.Chart(out_all).mark_bar().encode(x='name:N', y='quantity:Q').properties(height=300).interactive()
-        st.altair_chart(chart, use_container_width=True)
-          
-# Upload inventory
-elif menu == 'Upload Inventaris (Excel)':
-    st.title('Upload Inventaris Awal dari Excel')
-    st.markdown('Format yang disarankan: kolom `name`, `quantity`, `unit`, optional `category`, `min_stock`')
-    uploaded = st.file_uploader('Pilih file Excel (.xlsx) atau CSV', type=['xlsx', 'xls', 'csv'])
+        in_all = df_all[df_all["trx_type"]=="in"].groupby("name")["quantity"].sum().reset_index()
+        out_all = df_all[df_all["trx_type"]=="out"].groupby("name")["quantity"].sum().reset_index()
+        st.markdown("Grafik Total Masuk (seluruh waktu)")
+        c = alt.Chart(in_all).mark_bar().encode(x="name:N", y="quantity:Q").properties(height=300).interactive()
+        st.altair_chart(c, use_container_width=True)
+        st.markdown("Grafik Total Keluar (seluruh waktu)")
+        c2 = alt.Chart(out_all).mark_bar().encode(x="name:N", y="quantity:Q").properties(height=300).interactive()
+        st.altair_chart(c2, use_container_width=True)
+
+# --- Upload Inventaris ---
+elif menu == "Upload Inventaris (Excel)":
+    st.title("Upload Inventaris Awal dari Excel/CSV")
+    st.markdown("Format minimal: kolom `name`, `quantity`, `unit`. Optional: `category`, `min_stock`, `rack_location`, `expiry_date`")
+    uploaded = st.file_uploader("Pilih file Excel (.xlsx) atau CSV", type=["xlsx","xls","csv"])
     if uploaded:
         try:
-            if uploaded.name.lower().endswith('.csv'):
+            if uploaded.name.lower().endswith(".csv"):
                 df = pd.read_csv(uploaded)
-                buffer = io.BytesIO()
-                df.to_excel(buffer, index=False)
-                buffer.seek(0)
-                inserted = load_inventory_from_excel(buffer)
+                buf = io.BytesIO()
+                df.to_excel(buf, index=False)
+                buf.seek(0)
+                inserted = load_inventory_from_excel(buf)
             else:
                 inserted = load_inventory_from_excel(uploaded)
-            st.success(f'Sukses memuat {inserted} baris dari file ke inventaris')
+            st.success(f"Sukses memuat {inserted} baris dari file ke inventaris")
         except Exception as e:
-            st.error('Gagal memuat file: ' + str(e))
-    st.markdown('---')
-    st.subheader('Lihat Inventaris Saat Ini')
+            st.error("Gagal memuat file: " + str(e))
+    st.markdown("---")
+    st.subheader("Lihat Inventaris Saat Ini")
     st.dataframe(get_inventory_df())
 
-# Barang Masuk
-elif menu == 'Barang Masuk':
-    st.title('Form Barang Masuk')
-    st.write('Ada dua mode: Single-item atau Multi-item. Pilih mode di bawah.')
-    mode = st.radio('Mode input', ['Single-item','Multi-item'])
-
+# --- Barang Masuk ---
+elif menu == "Barang Masuk":
+    st.title("Form Barang Masuk")
+    mode = st.radio("Mode input", ["Single-item","Multi-item"])
     items_list = get_items_list()
 
-    # --- Single-item ---
-    if mode == 'Single-item':
-        st.subheader('Single-item (cepat)')
-        with st.form('in_single'):
-            use_existing = st.checkbox('Pilih dari daftar item yang ada', value=True)
-            if use_existing and items_list:
-                name_select = st.selectbox('Nama barang', ['-- (pilih) --'] + items_list)
-                if name_select != '-- (pilih) --':
-                    name = name_select
+    if mode == "Single-item":
+        with st.form("in_single"):
+            choose_existing = st.checkbox("Pilih dari daftar item yang ada", value=True)
+            if choose_existing and items_list:
+                name_sel = st.selectbox("Nama barang", ["-- (pilih) --"]+items_list)
+                if name_sel != "-- (pilih) --":
+                    name = name_sel
                     unit = get_item_unit(name)
                 else:
                     name = st.text_input("Nama barang baru")
@@ -552,437 +386,274 @@ elif menu == 'Barang Masuk':
             else:
                 name = st.text_input("Nama barang baru")
                 unit = st.text_input("Satuan")
-            quantity = st.number_input('Jumlah', min_value=0.0, value=0.0)
-            category = st.text_input('Kategori (opsional)')
-            min_stock = st.number_input('Min stok (opsional)', min_value=0.0, value=0.0)
-            supplier = st.text_input('Nama pemasok (opsional)')
-            rack_location = st.text_input('Rak Penempatan (opsional)')
-            expiry_date=st.text_input('Tanggal Kadaluarsa')
-            trx_code = generate_trx_code('in')
-            submitted = st.form_submit_button('Simpan Barang Masuk')
+            qty = st.number_input("Jumlah", min_value=0.0, value=0.0)
+            category = st.text_input("Kategori (opsional)")
+            min_stock = st.number_input("Min stok (opsional)", min_value=0.0, value=0.0)
+            supplier = st.text_input("Nama pemasok (opsional)")
+            rack_location = st.text_input("Rak Penempatan (opsional)")
+            expiry_date = st.date_input("Tanggal Kadaluarsa (opsional)", value=None)
+            submitted = st.form_submit_button("Simpan Barang Masuk")
             if submitted:
-                if not name or quantity <= 0 or not unit:
-                    st.error('Nama, jumlah (>0) dan satuan harus diisi')
+                if not name or qty <= 0 or not unit:
+                    st.error("Nama, jumlah (>0), dan satuan harus diisi")
                 else:
-                    item_id = upsert_item(name, category, unit, quantity, min_stock,rack_location)
-                    bundle = trx_code
-                    add_transaction_record('in', item_id, name, quantity, unit, requester=None, supplier=supplier, note='Single-item masuk', bundle_code=bundle, trx_code=trx_code)
-                    st.success(f'Sukses: {quantity} {unit} {name} ditambahkan. Trx: {trx_code}')
-                    st.rerun()
+                    item_id = upsert_item(name, category, unit, qty, min_stock, rack_location, expiry_date)
+                    trx_code = generate_trx_code("in")
+                    add_transaction_record("in", item_id, name, qty, unit, requester=None, supplier=supplier, note="Single-item masuk", bundle_code=trx_code, trx_code=trx_code, expiry_date=expiry_date)
+                    st.success(f"Sukses: {qty} {unit} {name} ditambahkan. Trx: {trx_code}")
+                    st.created_atrerun()
 
-    # --- Multi-item ---
-    # --- Multi-item ---
     else:
-        st.subheader('Multi-item (batch)')
-
-    # init session state
-        if 'in_multi' not in st.session_state:
+        # Multi-item
+        if "in_multi" not in st.session_state:
             st.session_state.in_multi = []
-
-    # tombol tambah baris
-        if st.button('Tambah Item'):
-            st.session_state.in_multi.append({'name':'','unit':'','quantity':0.0,'category':'','min_stock':0.0})
-
-    # ---------- FORM MULTI-ITEM ----------
-        # ---------- FORM MULTI-ITEM ----------
-        with st.form('in_multi_form'):
-            colA, colB = st.columns([2,1])
-            with colA:
-                tdate = st.date_input('Tanggal transaksi', value=datetime.now().date())
-                supplier = st.text_input('Nama pemasok')
-                note = st.text_area('Catatan transaksi (opsional)')
-            with colB:
-                st.write('Baris current:', len(st.session_state.in_multi))
-
-    # per baris
+        if st.button("Tambah Item"):
+            st.session_state.in_multi.append({"name":"","unit":"","quantity":0.0,"category":"","min_stock":0.0,"rack_location":"","expiry_date":""})
+        with st.form("in_multi_form"):
+            supplier = st.text_input("Nama pemasok")
+            note = st.text_area("Catatan transaksi (opsional)")
             for i, it in enumerate(st.session_state.in_multi):
-                st.markdown(f'**Item #{i+1}**')
-
-        # Tambah kolom expiry date → total 7 kolom
-                cols = st.columns([3, 1, 1, 2, 1, 2, 2])
-
-        # Nama barang
-                name_choice = cols[0].selectbox(
-                    f'Nama barang {i+1}',
-                    options=['-- (new / pilih) --'] + items_list,
-                    key=f'in_multi_name_sel_{i}'
-                )
-
-                if name_choice != '-- (new / pilih) --':
+                st.markdown(f"**Item #{i+1}**")
+                cols = st.columns([3,1,1,1,1,1,1])
+                name_choice = cols[0].selectbox(f"Nama {i+1}", options=["-- (new/pilih) --"]+items_list, key=f"in_name_sel_{i}")
+                if name_choice != "-- (new/pilih) --":
                     name = name_choice
                     unit = get_item_unit(name)
-                    cols[1].text_input('Satuan', value=unit, key=f'in_multi_unit_{i}')
+                    cols[1].text_input("Satuan", value=unit, key=f"in_unit_{i}")
                 else:
-                    name = cols[0].text_input('Nama barang (baru)', value=it.get('name', ''), key=f'in_multi_name_{i}')
-                    unit = cols[1].text_input('Satuan', value=it.get('unit', ''), key=f'in_multi_unit_{i}')
-
-                quantity = cols[2].number_input('Jumlah', min_value=0.0, value=float(it.get('quantity', 0.0)), key=f'in_multi_quantity_{i}')
-                min_stock = cols[3].number_input('Min stok', min_value=0.0, value=float(it.get('min_stock', 0.0)), key=f'in_multi_min_{i}')
-                rack_location = cols[5].text_input('Rak', value=it.get('rack_location',''), key=f'in_multi_rack_{i}')
-
-        # NEW → input expiry date per baris
-                expiry_date = cols[6].text_input(
-                    'Kadaluarsa',
-                    value=it.get('expiry_date', ''),
-                    key=f'in_multi_expiry_{i}'
-                )
-
-        # DELETE BUTTON
-                del_row = cols[4].form_submit_button("🗑")
-                if del_row:
+                    name = cols[0].text_input("Nama barang", value=it.get("name",""), key=f"in_name_{i}")
+                    unit = cols[1].text_input("Satuan", value=it.get("unit",""), key=f"in_unit_new_{i}")
+                qty = cols[2].number_input("Jumlah", min_value=0.0, value=float(it.get("quantity",0.0)), key=f"in_qty_{i}")
+                min_s = cols[3].number_input("Min stok", min_value=0.0, value=float(it.get("min_stock",0.0)), key=f"in_min_{i}")
+                rack = cols[4].text_input("Rak", value=it.get("rack_location",""), key=f"in_rack_{i}")
+                expiry = cols[5].text_input("Kadaluarsa", value=it.get("expiry_date",""), key=f"in_exp_{i}")
+                remove = cols[6].button("Hapus", key=f"in_del_{i}")
+                if remove:
                     st.session_state.in_multi.pop(i)
-                    st.rerun()
-
-        # UPDATE STATE
-                st.session_state.in_multi[i] = {
-                   'name': name,
-                   'unit': unit,
-                   'quantity': quantity,
-                   'category': it.get('category',''),
-                   'min_stock': min_stock,
-                   'rack_location': rack_location,
-                   'expiry_date': expiry_date
-                }
-
-            submitted = st.form_submit_button('Simpan Transaksi Masuk (Batch)')
-
-
-    # ---------- SETELAH SUBMIT ----------
-        if submitted:
-            if not st.session_state.in_multi:
-                st.error('Tidak ada item untuk disimpan')
-            else:
-            # validasi
-                errors = []
-                for idx, it in enumerate(st.session_state.in_multi):
-                    if not it['name'] or it['quantity'] <= 0 or not it['unit']:
-                        errors.append(f'Baris {idx+1}: Nama, satuan dan jumlah (>0) harus diisi')
-
-                if errors:
-                    st.error("\n".join(errors))
+                    st.created_atrerun()
+                st.session_state.in_multi[i] = {"name": name, "unit": unit, "quantity": qty, "category": it.get("category",""), "min_stock": min_s, "rack_location": rack, "expiry_date": expiry}
+            submitted = st.form_submit_button("Simpan Transaksi Masuk (Batch)")
+            if submitted:
+                if not st.session_state.in_multi:
+                    st.error("Tidak ada item untuk disimpan")
                 else:
-                    trx_code = generate_trx_code('in')
-                    bundle = trx_code
-                    for it in st.session_state.in_multi:
-                        item_id = upsert_item(it['name'], it.get('category',''), it['unit'], it['quantity'], it.get('min_stock',0.0),it.get('rack_location'),it.get('expiry_date'))
-                        add_transaction_record(
-                            'in', item_id, it['name'], it['quantity'], it['unit'],
-                            requester=None, supplier=supplier, note=note,
-                            bundle_code=bundle, trx_code=trx_code
-                        )
+                    errors = []
+                    for idx, it in enumerate(st.session_state.in_multi):
+                        if not it["name"] or it["quantity"] <= 0 or not it["unit"]:
+                            errors.append(f"Baris {idx+1}: Nama, satuan, dan jumlah (>0) harus diisi")
+                    if errors:
+                        st.error("\n".join(errors))
+                    else:
+                        trx_code = generate_trx_code("in")
+                        bundle = trx_code
+                        for it in st.session_state.in_multi:
+                            # convert expiry if string to date if possible
+                            exp = None
+                            if it.get("expiry_date"):
+                                try:
+                                    exp = pd.to_datetime(it.get("expiry_date")).date()
+                                except:
+                                    exp = None
+                            item_id = upsert_item(it["name"], it.get("category",""), it["unit"], it["quantity"], it.get("min_stock",0.0), it.get("rack_location",""), exp)
+                            add_transaction_record("in", item_id, it["name"], it["quantity"], it["unit"], requester=None, supplier=supplier, note=note, bundle_code=bundle, trx_code=trx_code, expiry_date=exp)
+                        st.success(f"Sukses menyimpan batch masuk. Trx: {trx_code}")
+                        st.session_state.in_multi = []
+                        st.created_atrerun()
 
-                    st.success(f'Sukses menyimpan batch masuk. Trx: {trx_code}')
-                    st.session_state.in_multi = []
-                    st.rerun()
-
-
-# Barang Keluar
-elif menu == 'Barang Keluar':
-    st.title('Form Barang Keluar')
-    st.write('Ada dua mode: Single-item atau Multi-item. Pilih mode di bawah.')
-    mode = st.radio('Mode input', ['Single-item','Multi-item'], key='out_mode')
-
+# --- Barang Keluar ---
+elif menu == "Barang Keluar":
+    st.title("Form Barang Keluar")
+    mode = st.radio("Mode input", ["Single-item","Multi-item"], key="out_mode")
     items_list = get_items_list()
 
-    # --- Single-item keluar ---
-    if mode == 'Single-item':
-        st.subheader('Single-item (cepat)')
-        with st.form('out_single'):
-            use_existing = st.checkbox('Pilih dari daftar item yang ada', value=True)
-            if use_existing and items_list:
-                name = st.selectbox('Nama barang', options=['-- (pilih) --'] + items_list)
-                if name == '-- (pilih) --':
-                    name = ''
-                unit = get_item_unit(name) if name else st.text_input('Satuan (baru)')
+    if mode == "Single-item":
+        with st.form("out_single"):
+            choose_existing = st.checkbox("Pilih dari daftar item yang ada", value=True)
+            if choose_existing and items_list:
+                name = st.selectbox("Nama barang", options=["-- (pilih) --"]+items_list)
+                if name == "-- (pilih) --":
+                    name = ""
+                unit = get_item_unit(name) if name else st.text_input("Satuan (baru)")
             else:
-                name = st.text_input('Nama barang')
-                unit = st.text_input('Satuan')
-            quantity = st.number_input('Jumlah', min_value=0.0, value=0.0)
-            requester = st.text_input('Nama peminta')
-            note = st.text_input('Keterangan (opsional)')
-            trx_code = generate_trx_code('out')
-            submitted = st.form_submit_button('Simpan Barang Keluar')
+                name = st.text_input("Nama barang")
+                unit = st.text_input("Satuan")
+            qty = st.number_input("Jumlah", min_value=0.0, value=0.0)
+            requester = st.text_input("Nama peminta")
+            note = st.text_input("Keterangan (opsional)")
+            submitted = st.form_submit_button("Simpan Barang Keluar")
             if submitted:
-                if not name or quantity <= 0 or not unit or not requester:
-                    st.error('Nama, jumlah (>0), satuan dan nama peminta harus diisi')
+                if not name or qty <= 0 or not unit or not requester:
+                    st.error("Nama, jumlah (>0), satuan dan nama peminta harus diisi")
                 else:
                     # validate stock
-                    with closing(get_conn()) as conn:
-                        cur = conn.cursor()
-                        cur.execute("SELECT quantity FROM items WHERE name=? AND unit=?", (name, unit))
-                        row = cur.fetchone()
-                        if not row:
-                            st.error('Item tidak ditemukan di inventory')
+                    res = supabase.table("items").select("quantity").eq("name", name).eq("unit", unit).limit(1).execute()
+                    if not res.data:
+                        st.error("Item tidak ditemukan di inventory")
+                    else:
+                        if (res.data[0].get("quantity") or 0) < qty:
+                            st.error(f"Stok tidak cukup. Stok: {res.data[0].get('quantity')}, diminta: {qty}")
                         else:
-                            if row[0] < quantity:
-                                st.error(f'Stok tidak cukup. Stok: {row[0]}, diminta: {quantity}')
+                            item_id, err = adjust_item_for_out(name, unit, qty)
+                            if err:
+                                st.error(err)
                             else:
-                                item_id = adjust_item_for_out(name, unit, quantity)[0]
-                                add_transaction_record('out', item_id, name, quantity, unit, requester=requester, supplier=None, note=note, bundle_code=trx_code, trx_code=trx_code)
-                                st.success(f'Sukses: {quantity} {unit} {name} dikeluarkan. Trx: {trx_code}')
-                                st.rerun()
-
-    # --- Multi-item keluar ---
+                                trx_code = generate_trx_code("out")
+                                add_transaction_record("out", item_id, name, qty, unit, requester=requester, supplier=None, note=note, bundle_code=trx_code, trx_code=trx_code)
+                                st.success(f"Sukses: {qty} {unit} {name} dikeluarkan. Trx: {trx_code}")
+                                st.created_atrerun()
     else:
-        st.subheader('Multi-item (batch)')
-        if 'out_multi' not in st.session_state:
+        # multi-item keluar
+        if "out_multi" not in st.session_state:
             st.session_state.out_multi = []
-        if st.button('Tambah Item Keluar'):
-            st.session_state.out_multi.append({'name':'','unit':'','quantity':0.0,'note':''})
-        with st.form('out_multi_form'):
-            colA, colB = st.columns([2,1])
-            with colA:
-                tdate = st.date_input('Tanggal transaksi', value=datetime.now().date())
-                requester = st.text_input('Nama peminta')
-                note = st.text_area('Catatan transaksi (opsional)')
-            with colB:
-                st.write('Transaction code akan dibuat otomatis setelah submit')
-                st.write('Baris current: ', len(st.session_state.out_multi))
-
+        if st.button("Tambah Item Keluar"):
+            st.session_state.out_multi.append({"name":"","unit":"","quantity":0.0,"note":""})
+        with st.form("out_multi_form"):
+            requester = st.text_input("Nama peminta")
+            note_all = st.text_area("Catatan transaksi (opsional)")
             for i, it in enumerate(st.session_state.out_multi):
-                st.markdown(f'**Item #{i+1}**')
+                st.markdown(f"**Item #{i+1}**")
                 cols = st.columns([3,1,1,2])
-                name_choice = cols[0].selectbox(f'Nama barang {i+1}', options=['-- (pilih/new) --'] + items_list, key=f'out_multi_name_sel_{i}')
-                if name_choice != '-- (pilih/new) --':
+                name_choice = cols[0].selectbox(f"Nama barang {i+1}", options=["-- (pilih/new) --"]+items_list, key=f"out_name_sel_{i}")
+                if name_choice != "-- (pilih/new) --":
                     name = name_choice
                     unit = get_item_unit(name)
-                    cols[1].text_input('Satuan', value=unit, key=f'out_multi_unit_{i}')
+                    cols[1].text_input("Satuan", value=unit, key=f"out_unit_{i}")
                 else:
-                    name = cols[0].text_input('Nama barang (baru)', value=it.get('name',''), key=f'out_multi_name_{i}')
-                    unit = cols[1].text_input('Satuan', value=it.get('unit',''), key=f'out_multi_unit_{i}')
-                quantity = cols[2].number_input('Jumlah', min_value=0.0, value=float(it.get('quantity',0.0)), key=f'out_multi_quantity_{i}')
-                note_item = cols[3].text_input('Keterangan', value=it.get('note',''), key=f'out_multi_note_{i}')
-                st.session_state.out_multi[i] = {'name': name, 'unit': unit, 'quantity': quantity, 'note': note_item}
-                delete = cols[3].form_submit_button("Hapus", key=f'del_out_multi_{i}')
-                if delete:
+                    name = cols[0].text_input("Nama barang", value=it.get("name",""), key=f"out_name_{i}")
+                    unit = cols[1].text_input("Satuan", value=it.get("unit",""), key=f"out_unit_new_{i}")
+                qty = cols[2].number_input("Jumlah", min_value=0.0, value=float(it.get("quantity",0.0)), key=f"out_qty_{i}")
+                note_item = cols[3].text_input("Keterangan", value=it.get("note",""), key=f"out_note_{i}")
+                remove = cols[3].button("Hapus", key=f"out_del_{i}")
+                if remove:
                     st.session_state.out_multi.pop(i)
-                    st.rerun()
-
-                
-
-            submitted = st.form_submit_button('Simpan Transaksi Keluar (Batch)')
+                    st.created_atrerun()
+                st.session_state.out_multi[i] = {"name": name, "unit": unit, "quantity": qty, "note": note_item}
+            submitted = st.form_submit_button("Simpan Transaksi Keluar (Batch)")
             if submitted:
-                # validate
                 if not st.session_state.out_multi:
-                    st.error('Tidak ada item untuk disimpan')
+                    st.error("Tidak ada item untuk disimpan")
                 elif not requester:
-                    st.error('Nama peminta harus diisi')
+                    st.error("Nama peminta harus diisi")
                 else:
                     bad = []
                     for idx, it in enumerate(st.session_state.out_multi):
-                        if not it['name'] or it['quantity'] <= 0 or not it['unit']:
-                            bad.append(f'Baris {idx+1}: Nama, satuan dan jumlah (>0) harus diisi')
+                        if not it["name"] or it["quantity"] <= 0 or not it["unit"]:
+                            bad.append(f"Baris {idx+1}: Nama, satuan dan jumlah (>0) harus diisi")
                     if bad:
-                        st.error('\n'.join(bad))
+                        st.error("\n".join(bad))
                     else:
-                        # Check stock for all items first; reject all if any insufficient
+                        # check all stocks first
                         insufficient = []
-                        with closing(get_conn()) as conn:
-                            cur = conn.cursor()
-                            for it in st.session_state.out_multi:
-                                cur.execute("SELECT quantity FROM items WHERE name=? AND unit=?", (it['name'], it['unit']))
-                                row = cur.fetchone()
-                                if not row:
-                                    insufficient.append((it['name'], 'Item tidak ditemukan'))
-                                else:
-                                    if row[0] < it['quantity']:
-                                        insufficient.append((it['name'], f"Stok: {row[0]}, diminta: {it['quantity']}"))
+                        for it in st.session_state.out_multi:
+                            res = supabase.table("items").select("quantity").eq("name", it["name"]).eq("unit", it["unit"]).limit(1).execute()
+                            if not res.data:
+                                insufficient.append((it["name"], "Item tidak ditemukan"))
+                            else:
+                                if (res.data[0].get("quantity") or 0) < it["quantity"]:
+                                    insufficient.append((it["name"], f"Stok: {res.data[0].get('quantity')}, diminta: {it['quantity']}"))
                         if insufficient:
                             msgs = [f"{n}: {m}" for n,m in insufficient]
-                            st.error('Transaksi ditolak karena stok tidak mencukupi atau item hilang:\n' + '\n'.join(msgs))
+                            st.error("Transaksi ditolak karena stok tidak mencukupi atau item hilang:\n" + "\n".join(msgs))
                         else:
-                            trx_code = generate_trx_code('out')
+                            trx_code = generate_trx_code("out")
                             bundle = trx_code
-                            # All good: perform adjustments and records
                             for it in st.session_state.out_multi:
-                                item_id, _ = adjust_item_for_out(it['name'], it['unit'], it['quantity'])
-                                add_transaction_record('out', item_id, it['name'], it['quantity'], it['unit'], requester=requester, supplier=None, note=it.get('note',''), bundle_code=bundle, trx_code=trx_code)
-                            st.success(f'Sukses menyimpan batch keluar. Trx: {trx_code}')
+                                item_id, _ = adjust_item_for_out(it["name"], it["unit"], it["quantity"])
+                                add_transaction_record("out", item_id, it["name"], it["quantity"], it["unit"], requester=requester, supplier=None, note=it.get("note",""), bundle_code=bundle, trx_code=trx_code)
+                            st.success(f"Sukses menyimpan batch keluar. Trx: {trx_code}")
                             st.session_state.out_multi = []
-                            st.rerun()
+                            st.created_atrerun()
 
-    st.markdown('---')
-    st.subheader('Inventaris Saat Ini')
+    st.markdown("---")
+    st.subheader("Inventaris Saat Ini")
     st.dataframe(get_inventory_df())
 
-# Laporan & Analisis
-elif menu == 'Laporan & Analisis':
-    st.title('Laporan & Analisis')
+# --- Laporan & Analisis ---
+elif menu == "Laporan & Analisis":
+    st.title("Laporan & Analisis")
     df = load_transactions_df()
-    inv = get_inventory_df()
-
-    st.subheader('Filter')
+    st.subheader("Filter")
     col1, col2, col3 = st.columns(3)
     with col1:
-        period = st.selectbox('Periode', ['Mingguan', 'Bulanan'])
+        period = st.selectbox("Periode", ["Mingguan","Bulanan"])
     with col2:
-        date_from = st.date_input('Dari', value=(datetime.now().date() - timedelta(days=30)))
+        date_from = st.date_input("Dari", value=(datetime.now().date() - timedelta(days=30)))
     with col3:
-        date_to = st.date_input('Sampai', value=datetime.now().date())
+        date_to = st.date_input("Sampai", value=datetime.now().date())
     date_from = pd.to_datetime(date_from)
     date_to = pd.to_datetime(date_to)
-    st.markdown('---')
+    st.markdown("---")
     if df.empty:
-        st.info('Belum ada transaksi untuk ditampilkan')
+        st.info("Belum ada transaksi untuk ditampilkan")
     else:
-        st.subheader('Total per Item dalam Periode Terpilih')
         totals = totals_for_period(df, date_from=date_from, date_to=date_to)
+        st.subheader("Total per Item dalam Periode Terpilih")
         st.dataframe(totals)
-                       
-           
-        in_period = df[(df['trx_type']=='in') & (df['date']>=date_from) & (df['date']<=date_to)]
-        out_period = df[(df['trx_type']=='out') & (df['date']>=date_from) & (df['date']<=date_to)]
+        in_period = df[(df["trx_type"]=="in") & (df["date"]>=date_from) & (df["date"]<=date_to)]
+        out_period = df[(df["trx_type"]=="out") & (df["date"]>=date_from) & (df["date"]<=date_to)]
         st.subheader("Transaksi Masuk (IN)")
         if in_period.empty:
-            st.info('Tidak ada transaksi masuk pada periode yang dipilih')
+            st.info("Tidak ada transaksi masuk pada periode yang dipilih")
         else:
-            
             st.dataframe(in_period)
-            st.markdown('Grafik: Total Masuk per Item (periode terpilih)')
-            in_sum = in_period.groupby('name')['quantity'].sum().reset_index()
-            chart = alt.Chart(in_sum).mark_bar().encode(x='name:N', y='quantity:Q').properties(height=300).interactive()
-            st.altair_chart(chart, use_container_width=True)
-       
-        
+            st.markdown("Grafik: Total Masuk per Item (periode terpilih)")
+            in_sum = in_period.groupby("name")["quantity"].sum().reset_index()
+            st.altair_chart(alt.Chart(in_sum).mark_bar().encode(x="name:N", y="quantity:Q").properties(height=300), use_container_width=True)
         st.subheader("Transaksi Keluar (OUT)")
         if out_period.empty:
-            st.info('Tidak ada transaksi keluar pada periode yang dipilih')
+            st.info("Tidak ada transaksi keluar pada periode yang dipilih")
         else:
-            
             st.dataframe(out_period)
-            st.markdown('Grafik: Total Keluar per Item (periode terpilih)')
-            out_sum = out_period.groupby('name')['quantity'].sum().reset_index()
-            chart = alt.Chart(out_sum).mark_bar().encode(x='name:N', y='quantity:Q').properties(height=300).interactive()
-            st.altair_chart(chart, use_container_width=True)    
-        st.markdown('---')
-        
-        
-        if period == 'Mingguan':
-            st.subheader('Ringkasan per Minggu (Total per Item)')
-            g = summary_by_period(df, period='W')
-            if g.empty:
-                st.info('Tidak ada data mingguan')
+            out_sum = out_period.groupby("name")["quantity"].sum().reset_index()
+            st.altair_chart(alt.Chart(out_sum).mark_bar().encode(x="name:N", y="quantity:Q").properties(height=300), use_container_width=True)
+
+        # Monthly/Weekly summary
+        if period == "Mingguan":
+            g = df.copy()
+            g["week"] = g["created_at"].dt.strftime("%Y-%W")
+            pivot = g.groupby(["week","name","unit","trx_type"])["quantity"].sum().reset_index()
+            if pivot.empty:
+                st.info("Tidak ada data mingguan")
             else:
-                trx_choice = st.selectbox("Pilih transaksi", ["in", "out"])
-                pivot = g.pivot_table(index=['week','name','unit'], columns='trx_type', values='quantity', aggfunc='sum').fillna(0).reset_index()
-                if 'in' not in pivot.columns:
-                    pivot['in'] = 0
-                if 'out' not in pivot.columns:
-                    pivot['out'] = 0
-                pivot = pivot.rename(columns={'in':'total_masuk','out':'total_keluar'})
                 st.dataframe(pivot)
-                week_choice = st.selectbox('Pilih minggu (start date)', sorted(pivot['week'].unique()), index=0)
-                pick = pivot[pivot['week']==week_choice]
-                if not pick.empty:
-                    show_col = 'total_masuk' if trx_choice=='in' else 'total_keluar'
-
-                    st.markdown(f"Grafik: Total {trx_choice} per Item pada minggu terpilih")
-
-                    chart2 = alt.Chart(pick).mark_bar().encode(
-                        x='name:N',
-                        y=f'{show_col}:Q'
-                    ).properties(height=300).interactive()
-
-                    st.altair_chart(chart2, use_container_width=True)
-
         else:
-            st.subheader('Ringkasan per Bulan (Total per Item)')
-            g = summary_by_period(df, period='M')
-            if g.empty:
-                st.info('Tidak ada data bulanan')
+            g = df.copy()
+            g["month"] = g["created_at"].dt.strftime("%Y-%m")
+            pivot = g.groupby(["month","name","unit","trx_type"])["quantity"].sum().reset_index()
+            if pivot.empty:
+                st.info("Tidak ada data bulanan")
             else:
-                trx_choice = st.selectbox("Pilih transaksi", ["in", "out"])
-                pivot = g.pivot_table(index=['month','name','unit'], columns='trx_type', values='quantity', aggfunc='sum').fillna(0).reset_index()
-                if 'in' not in pivot.columns:
-                    pivot['in'] = 0
-                if 'out' not in pivot.columns:
-                    pivot['out'] = 0
-                pivot = pivot.rename(columns={'in':'total_masuk','out':'total_keluar'})
                 st.dataframe(pivot)
-                month_choice = st.selectbox('Pilih bulan', sorted(pivot['month'].unique()), index=0)
-                pick = pivot[pivot['month']==month_choice]
-                if not pick.empty:
-                    show_col = 'total_masuk' if trx_choice=='in' else 'total_keluar'
 
-                    st.markdown(f"Grafik: Total {trx_choice} per Item pada minggu terpilih")
+    st.markdown("---")
+    st.subheader("Download Data")
+    if st.button("Download seluruh DB (Excel)"):
+        bytes_xlsx = export_db_to_excel_bytes()
+        st.download_button("Klik untuk download seluruh DB", bytes_xlsx, file_name="gudang_supabase.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-                    chart2 = alt.Chart(pick).mark_bar().encode(
-                        x='name:N',
-                        y=f'{show_col}:Q'
-                    ).properties(height=300).interactive()
-
-                    st.altair_chart(chart2, use_container_width=True)
-
-        st.markdown('---')
-        st.subheader('Perbandingan Bulanan (pilih dua bulan)')
-        months = sorted(df['month'].dropna().unique())
-        if len(months) < 2:
-            st.info('Butuh minimal 2 bulan data untuk perbandingan')
-        else:
-            colA, colB = st.columns(2)
-            with colA:
-                m1 = st.selectbox('Bulan A', months, index=max(0, len(months)-2))
-            with colB:
-                m2 = st.selectbox('Bulan B', months, index=max(0, len(months)-1))
-            items = sorted(df['name'].unique())
-            sel_items = st.multiselect('Pilih item untuk bandingkan', items, default=items[:5])
-            cmp = compare_months(df, m1, m2, items_list=sel_items if sel_items else None)
-            if cmp.empty:
-                st.info('Tidak ada data untuk perbandingan pada item/bulan terpilih')
-            else:
-                st.dataframe(cmp)
-                if 'difference' in cmp.columns:
-                    chart_cmp = alt.Chart(cmp).mark_bar().encode(x='name:N', y='difference:Q').properties(height=300).interactive()
-                    st.altair_chart(chart_cmp, use_container_width=True)
-
-    st.markdown('---')
-    st.subheader('Download Data')
-    df_all = load_transactions_df()
-    totals_selected = totals_for_period(df_all, date_from=date_from, date_to=date_to)
-    reports = {
-        'inventory': get_inventory_df(),
-        'transactions': df_all,
-        'totals_period_selected': totals_selected
-    }
-    if st.button('Download seluruh DB (Excel)'):
-        data = export_db_to_excel()
-        st.download_button('Klik untuk download seluruh DB', data, file_name='gudang_konsumsi.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-
-    if st.button('Download laporan (Masuk / Keluar / Totals periode)'):
-        bytes_xlsx = export_df_to_excel_bytes(reports)
-        st.download_button('Download laporan terpilih', bytes_xlsx, file_name='gudang_laporan.xlsx', mime='application/vnd.openxmlformats-officedocument-spreadsheetml.sheet')
-
-# Pengaturan
-elif menu == 'Pengaturan':
-    st.title('Pengaturan')
-    st.subheader('Manajemen User (Sederhana)')
-    with st.form('form_user'):
-        new_user = st.text_input('Username baru')
-        new_pw = st.text_input('Password', type='password')
-        submitted = st.form_submit_button('Tambah user')
+# --- Pengaturan ---
+elif menu == "Pengaturan":
+    st.title("Pengaturan")
+    st.subheader("Manajemen User (Sederhana)")
+    with st.form("form_user"):
+        new_user = st.text_input("Username baru")
+        new_pw = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Tambah user")
         if submitted:
             if not new_user or not new_pw:
-                st.error('Isi username dan password')
+                st.error("Isi username dan password")
             else:
-                with closing(get_conn()) as conn:
-                    cur = conn.cursor()
-                    try:
-                        cur.execute("INSERT INTO users(username, password_hash) VALUES (?, ?)", (new_user, hash_pw(new_pw)))
-                        conn.commit()
-                        st.success('User ditambahkan')
-                    except Exception as e:
-                        st.error('Gagal menambah user: ' + str(e))
-
-    st.markdown('---')
-    st.subheader('Hapus / Reset DB (HATI-HATI)')
-    if st.checkbox('Tunjukkan opsi reset DB'):
-        if st.button('Reset seluruh DB (hapus items & transactions & users)'):
-            with closing(get_conn()) as conn:
-                cur = conn.cursor()
-                cur.execute('DROP TABLE IF EXISTS transactions')
-                cur.execute('DROP TABLE IF EXISTS items')
-                cur.execute('DROP TABLE IF EXISTS users')
-                conn.commit()
-            st.success('DB telah direset. App akan menginisialisasi ulang DB. Silakan refresh.')
-
-# End of file
+                try:
+                    supabase.table("users").insert({"username": new_user, "password_hash": hash_pw(new_pw)}).execute()
+                    st.success("User ditambahkan")
+                except Exception as e:
+                    st.error("Gagal menambah user: " + str(e))
+    st.markdown("---")
+    st.subheader("Hapus / Reset DB (HATI-HATI)")
+    if st.checkbox("Tunjukkan opsi reset DB"):
+        if st.button("Reset seluruh DB (hapus semua records)"):
+            # Hati-hati: hanya menghapus isi tabel, tidak menjatuhkan struktur.
+            supabase.table("transactions").delete().neq("id", -1).execute()
+            supabase.table("items").delete().neq("id", -1).execute()
+            supabase.table("users").delete().neq("username", "keep_admin").execute()  # contoh: mengosongkan users
+            st.success("DB telah dikosongkan. Silakan refresh.")
